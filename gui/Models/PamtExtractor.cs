@@ -42,8 +42,8 @@ public static class PamtExtractor
                 var buffer = new byte[readSize];
                 paz.ReadExactly(buffer);
 
-                // Decrypt XML files using filename-derived key
-                if (IsXmlFile(entry.FullPath))
+                // Decrypt ChaCha20-encrypted files using filename-derived key
+                if (entry.IsEncrypted)
                 {
                     string basename = Path.GetFileName(entry.FullPath);
                     buffer = PazNative.Decrypt(buffer, basename);
@@ -78,10 +78,5 @@ public static class PamtExtractor
 
             return (total, decrypted, decompressed);
         }, ct);
-    }
-
-    private static bool IsXmlFile(string path)
-    {
-        return path.EndsWith(".xml", StringComparison.OrdinalIgnoreCase);
     }
 }

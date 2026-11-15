@@ -194,6 +194,19 @@ def _():
     assert e2.compression_type == 0
     assert e2.encrypted == False
 
+    # Non-.xml entry with PAMT encryption nibble (0x3) is encrypted
+    e3 = PazEntry(path='material/dist/abyssdissolve.material', paz_file='0.paz', offset=0,
+                  comp_size=1372, orig_size=5101, flags=0x01320000, paz_index=0)
+    assert e3.compressed == True
+    assert e3.compression_type == 2
+    assert e3.encrypted == True
+
+    # .xml entry with PAMT encryption nibble == 0 is unencrypted
+    e4 = PazEntry(path='sound/charactersoundconfig.xml', paz_file='0.paz', offset=0,
+                  comp_size=8960, orig_size=8960, flags=0x01000000, paz_index=0)
+    assert e4.compressed == False
+    assert e4.encrypted == False
+
 @test("parse synthetic PAMT")
 def _():
     buf = bytearray()
@@ -239,6 +252,56 @@ def _():
         e = entries[0]
         assert 'test.xml' in e.path
         assert e.offset == 256
+        assert e.comp_size == 100
+        assert e.orig_size == 200
+        assert e.compression_type == 2
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+@test("parse synthetic PAMT (varint + extension table)")
+def _():
+    buf = bytearray()
+    buf += struct.pack('<I', 0x08312440)  # magic
+    buf += struct.pack('<I', 1)           # paz_count
+    buf += struct.pack('<II', 0x610E0232, 0)
+
+    # PAZ table
+    buf += struct.pack('<II', 0x12D614B4, 4096)
+
+    # Folder section: "texture" (off 0), "/decal" (off 9, delta 9 -> parent 0)
+    folder = bytearray()
+    folder += bytes([0, 7]) + b'texture'
+    folder += bytes([9, 6]) + b'/decal'
+    buf += struct.pack('<I', len(folder)) + folder
+
+    # Node section: "b" (off 0), "lood_01" (off 3, delta 3 -> parent 0)
+    nodes = bytearray()
+    nodes += bytes([0, 1]) + b'b'
+    nodes += bytes([3, 7]) + b'lood_01'
+    buf += struct.pack('<I', len(nodes)) + nodes
+
+    # Record section: 1 folder record referencing folder offset 9 ("texture/decal")
+    buf += struct.pack('<II', 1, 0)
+    buf += struct.pack('<IIII', 9, 0, 1, 0)
+    # 1 file record referencing node offset 3 ("blood_01") with ext index 1 (".dds") and LZ4 (0x02)
+    buf += struct.pack('<IIIII', 3, 512, 100, 200, 0x01020000)
+
+    # Extension table: ["", ".dds", ".xml"]
+    ext_table = b'\x00.dds\x00.xml\x00'
+    buf += struct.pack('<I', len(ext_table)) + ext_table
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        pamt_path = os.path.join(tmpdir, '0.pamt')
+        with open(pamt_path, 'wb') as f:
+            f.write(bytes(buf))
+
+        entries = parse_pamt(pamt_path, paz_dir=tmpdir)
+        assert len(entries) == 1
+        e = entries[0]
+        assert e.path == 'texture/decal/blood_01.dds', f'Got {e.path}'
+        assert e.offset == 512
         assert e.comp_size == 100
         assert e.orig_size == 200
         assert e.compression_type == 2

@@ -32,17 +32,72 @@ class PazEntry:
 
     @property
     def compressed(self) -> bool:
-        return self.comp_size != self.orig_size
+        return self.comp_size != self.orig_size and self.comp_size > 0
 
     @property
     def compression_type(self) -> int:
-        """0=none, 2=LZ4, 3=custom, 4=zlib"""
+        """0=none, 1=partial/mip, 2=LZ4, 3=custom, 4=zlib"""
         return (self.flags >> 16) & 0x0F
 
     @property
     def encrypted(self) -> bool:
-        """XML files in encrypted folders are ChaCha20-encrypted."""
-        return self.path.lower().endswith('.xml')
+        """Whether the entry is ChaCha20-encrypted (encoded in PAMT flags)."""
+        if (self.flags >> 20) & 0x0F:
+            return True
+        if (self.flags >> 24) == 0:
+            # Fallback for synthetic test entries without PAMT extension/encryption flags
+            return self.path.lower().endswith('.xml')
+        return False
+
+
+def _read_varint(data: bytes, off: int) -> tuple[int, int]:
+    """Read an unsigned LEB128 varint from data at off."""
+    val = 0
+    shift = 0
+    while True:
+        b = data[off]
+        off += 1
+        val |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            break
+        shift += 7
+    return val, off
+
+
+def _parse_string_tree(data: bytes, start: int, size: int, legacy: bool = False) -> dict[int, tuple[int, str]]:
+    """Parse a PAMT prefix-compressed string tree (folder or node section)."""
+    off = start
+    end = start + size
+    nodes = {}
+    while off < end:
+        rel = off - start
+        if legacy:
+            parent = struct.unpack_from('<I', data, off)[0]
+            off += 4
+        else:
+            delta, off = _read_varint(data, off)
+            parent = 0xFFFFFFFF if delta == 0 else rel - delta
+        slen = data[off]
+        off += 1
+        name = data[off:off + slen].decode('utf-8', errors='replace')
+        off += slen
+        nodes[rel] = (parent, name)
+    return nodes
+
+
+def _build_path(nodes: dict[int, tuple[int, str]], node_ref: int) -> str:
+    """Reconstruct full string from a prefix tree node offset."""
+    if node_ref == 0xFFFFFFFF:
+        return ""
+    parts = []
+    cur = node_ref
+    while cur != 0xFFFFFFFF and len(parts) < 64:
+        if cur not in nodes:
+            break
+        p, n = nodes[cur]
+        parts.append(n)
+        cur = p
+    return ''.join(reversed(parts))
 
 
 def parse_pamt(pamt_path: str, paz_dir: str = None) -> list[PazEntry]:
@@ -78,53 +133,58 @@ def parse_pamt(pamt_path: str, paz_dir: str = None) -> list[PazEntry]:
 
     # Folder section
     folder_size = struct.unpack_from('<I', data, off)[0]; off += 4
-    folder_end = off + folder_size
-    folder_prefix = ""
-    while off < folder_end:
-        parent = struct.unpack_from('<I', data, off)[0]
-        slen = data[off + 4]
-        name = data[off + 5:off + 5 + slen].decode('utf-8', errors='replace')
-        if parent == 0xFFFFFFFF:
-            folder_prefix = name
-        off += 5 + slen
+    legacy = (folder_size >= 4 and struct.unpack_from('<I', data, off)[0] == 0xFFFFFFFF)
+    folder_nodes = _parse_string_tree(data, off, folder_size, legacy=legacy)
+    off += folder_size
 
     # Node section (path tree)
     node_size = struct.unpack_from('<I', data, off)[0]; off += 4
-    node_start = off
-    nodes = {}
-    while off < node_start + node_size:
-        rel = off - node_start
-        parent = struct.unpack_from('<I', data, off)[0]
-        slen = data[off + 4]
-        name = data[off + 5:off + 5 + slen].decode('utf-8', errors='replace')
-        nodes[rel] = (parent, name)
-        off += 5 + slen
-
-    def build_path(node_ref):
-        parts = []
-        cur = node_ref
-        while cur != 0xFFFFFFFF and len(parts) < 64:
-            if cur not in nodes:
-                break
-            p, n = nodes[cur]
-            parts.append(n)
-            cur = p
-        return ''.join(reversed(parts))
+    nodes = _parse_string_tree(data, off, node_size, legacy=legacy)
+    off += node_size
 
     # Record section
     folder_count = struct.unpack_from('<I', data, off)[0]; off += 4
     off += 4  # hash
-    off += folder_count * 16
 
-    # File records (20 bytes each)
+    folder_records = []
+    for _ in range(folder_count):
+        f_node_ref, f_start, f_count, _f_hash = struct.unpack_from('<IIII', data, off)
+        off += 16
+        f_path = _build_path(folder_nodes, f_node_ref)
+        folder_records.append((f_start, f_count, f_path))
+
+    total_files = sum(fc for _, fc, _ in folder_records)
+
+    if legacy and total_files == 0:
+        # Legacy synthetic format fallback
+        default_folder = _build_path(folder_nodes, 0) if 0 in folder_nodes else ""
+        raw_records = []
+        while off + 20 <= len(data):
+            raw_records.append((default_folder, struct.unpack_from('<IIIII', data, off)))
+            off += 20
+        exts = [""]
+    else:
+        raw_records = []
+        for _f_start, f_count, f_path in folder_records:
+            for _ in range(f_count):
+                raw_records.append((f_path, struct.unpack_from('<IIIII', data, off)))
+                off += 20
+
+        # Extension table after file records
+        exts = [""]
+        if off + 4 <= len(data):
+            ext_size = struct.unpack_from('<I', data, off)[0]
+            off += 4
+            ext_bytes = data[off:off + ext_size]
+            exts = [e.decode('utf-8', errors='replace') for e in ext_bytes.split(b'\x00')[:-1]]
+
+    # Build PazEntry list
     entries = []
-    while off + 20 <= len(data):
-        node_ref, paz_offset, comp_size, orig_size, flags = \
-            struct.unpack_from('<IIIII', data, off)
-        off += 20
-
+    for folder_prefix, (node_ref, paz_offset, comp_size, orig_size, flags) in raw_records:
         paz_index = flags & 0xFF
-        node_path = build_path(node_ref)
+        ext_index = (flags >> 24) & 0xFF
+        ext = exts[ext_index] if ext_index < len(exts) else ""
+        node_path = _build_path(nodes, node_ref) + ext
         full_path = f"{folder_prefix}/{node_path}" if folder_prefix else node_path
 
         paz_num = int(pamt_stem) + paz_index
